@@ -8,3 +8,7 @@ services:
     envVars:
       - key: GOOGLE_API_KEY
         value: AIzaSyAhmTu5wmrHZeNx5kBQddKYzOPUkzdWyuo
+      - key: QDRANT_URL
+        value: https://bb560e89-f012-42af-9c3b-a54cafcfe557.us-east-1-0.aws.cloud.qdrant.io:6333
+      - key: QDRANT_API_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.M4lKKRvzHM74AwXc5gkOfoHoKtqtTEZE301HOmNM-FY

@@ -37,9 +37,9 @@ class PDFChatbotState(TypedDict):
 
 class PDFChatbot:
     def __init__(self, 
-                 google_api_key: str = None,
-                 qdrant_url: str = "http://localhost:6333",
-                 qdrant_api_key: str = None,
+                 google_api_key: str = "AIzaSyAhmTu5wmrHZeNx5kBQddKYzOPUkzdWyuo",
+                 qdrant_url: str = "https://bb560e89-f012-42af-9c3b-a54cafcfe557.us-east-1-0.aws.cloud.qdrant.io:6333",             
+                           qdrant_api_key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.M4lKKRvzHM74AwXc5gkOfoHoKtqtTEZE301HOmNM-FY",
                  collection_name: str = "pdf_documents"):
         """
         Initialize the PDF chatbot
