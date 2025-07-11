@@ -1,352 +1,371 @@
 import os
-import tempfile
-from typing import List, Sequence, Dict, Any
-from typing_extensions import Annotated, TypedDict
-import getpass
+import json
+import hashlib
+import sqlite3
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+import torch
+import faiss
+import PyPDF2
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Core LangChain imports
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.documents import Document
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-
-# LangGraph imports
-from langgraph.graph import StateGraph, START
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
-
-# Document processing imports
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# Vector store imports
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
-
-# Embeddings and LLM imports
-from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_core.messages import trim_messages
-
-class PDFChatbotState(TypedDict):
-    """State for our PDF chatbot"""
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    pdf_processed: bool
-    collection_name: str
-
-class PDFChatbot:
-    def __init__(self, 
-                 google_api_key: str = "AIzaSyAhmTu5wmrHZeNx5kBQddKYzOPUkzdWyuo",
-                 qdrant_url: str = "https://bb560e89-f012-42af-9c3b-a54cafcfe557.us-east-1-0.aws.cloud.qdrant.io:6333",             
-                           qdrant_api_key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.M4lKKRvzHM74AwXc5gkOfoHoKtqtTEZE301HOmNM-FY",
-                 collection_name: str = "pdf_documents"):
-        """
-        Initialize the PDF chatbot
-        
-        Args:
-            google_api_key: Google API key for Gemini
-            qdrant_url: Qdrant server URL
-            qdrant_api_key: Qdrant API key (if using cloud)
-            collection_name: Name for the vector collection
-        """
-        # Set up API keys
-        if google_api_key:
-            os.environ["GOOGLE_API_KEY"] = google_api_key
-        elif not os.environ.get("GOOGLE_API_KEY"):
-            os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter your Google API key: ")
-        
-        self.collection_name = collection_name
-        
-        # Initialize Qdrant client
-        if qdrant_api_key:
-            self.qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-        else:
-            self.qdrant_client = QdrantClient(url=qdrant_url)
-        
-        # Initialize embeddings and LLM
-        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        self.llm = GoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
-        
-        # Initialize text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
-        
-        # Initialize vector store
-        self.vector_store = None
-        
-        # Create prompt template
-        self.prompt_template = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                """You are a helpful assistant that answers questions based on the provided PDF document context. 
-                Use the following pieces of context to answer the user's question. If you don't know the answer 
-                based on the context, just say that you don't know - don't try to make up an answer.
-                
-                Context: {context}
-                
-                Always cite the relevant sections when providing answers."""
-            ),
-            MessagesPlaceholder(variable_name="messages"),
-        ])
-        
-        # Set up message trimmer
-        self.trimmer = trim_messages(
-            max_tokens=4000,
-            strategy="last",
-            token_counter=self.llm,
-            include_system=True,
-            allow_partial=False,
-            start_on="human",
-        )
-        
-        # Build the workflow
-        self._build_workflow()
+class FreeQueryExpansionCache:
+    """Free version using local storage and simple similarity"""
     
-    def _build_workflow(self):
-        """Build the LangGraph workflow"""
-        workflow = StateGraph(state_schema=PDFChatbotState)
+    def __init__(self, db_path: str = "query_cache.db"):
+        self.db_path = db_path
+        self.init_database()
+        self.load_synonym_database()
         
-        # Add nodes
-        workflow.add_node("chat", self._chat_node)
+        # Load free sentence transformer for embeddings
+        print("Loading sentence transformer model...")
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Add edges
-        workflow.add_edge(START, "chat")
-        
-        # Compile with memory
-        memory = MemorySaver()
-        self.app = workflow.compile(checkpointer=memory)
+        # Simple rule-based expansion patterns
+        self.expansion_patterns = {
+            'financial': ['revenue', 'sales', 'profit', 'income', 'earnings', 'cost', 'expense'],
+            'temporal': ['quarterly', 'annual', 'monthly', 'yearly', 'q1', 'q2', 'q3', 'q4'],
+            'business': ['employee', 'customer', 'client', 'project', 'product', 'service'],
+            'metrics': ['performance', 'growth', 'efficiency', 'quality', 'roi', 'kpi']
+        }
     
-    def _setup_vector_store(self):
-        """Set up the vector store with the processed documents"""
-        # Create collection if it doesn't exist
-        try:
-            self.qdrant_client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=768,  # Dimension for Google's embedding model
-                    distance=Distance.COSINE
+    def init_database(self):
+        """Initialize SQLite database"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS query_expansions (
+                    query_hash TEXT PRIMARY KEY,
+                    original_query TEXT,
+                    expanded_terms TEXT,
+                    created_at TIMESTAMP,
+                    access_count INTEGER DEFAULT 0
                 )
-            )
-        except Exception as e:
-            # Collection might already exist
-            print(f"Collection setup info: {e}")
-        
-        # Initialize vector store
-        self.vector_store = QdrantVectorStore(
-            client=self.qdrant_client,
-            collection_name=self.collection_name,
-            embedding=self.embeddings,
-        )
+            ''')
+            conn.commit()
     
-    def upload_pdf(self, pdf_path: str) -> str:
-        """
-        Upload and process a PDF file
-        
-        Args:
-            pdf_path: Path to the PDF file
+    def load_synonym_database(self):
+        """Enhanced synonym database"""
+        self.synonyms = {
+            # Financial terms
+            "revenue": ["sales", "income", "earnings", "turnover", "net sales", "gross sales", "receipts"],
+            "profit": ["net income", "earnings", "bottom line", "net profit", "operating profit", "margin"],
+            "cost": ["expense", "expenditure", "spending", "outlay", "charges", "fees"],
+            "budget": ["allocation", "funds", "financial plan", "spending plan", "allowance"],
+            "loss": ["deficit", "shortfall", "negative", "red ink", "losses"],
             
-        Returns:
-            Success message
-        """
+            # Business operations
+            "employee": ["staff", "worker", "personnel", "team member", "workforce", "human resources"],
+            "customer": ["client", "consumer", "buyer", "patron", "user", "purchaser"],
+            "product": ["item", "goods", "merchandise", "offering", "solution", "commodity"],
+            "service": ["offering", "solution", "support", "assistance", "help"],
+            "project": ["initiative", "program", "task", "assignment", "undertaking", "venture"],
+            "company": ["organization", "business", "firm", "corporation", "enterprise"],
+            
+            # Time periods
+            "quarterly": ["q1", "q2", "q3", "q4", "quarter", "three months", "3 months"],
+            "annual": ["yearly", "year", "12 months", "fiscal year", "per year"],
+            "monthly": ["month", "30 days", "per month", "each month"],
+            "daily": ["day", "per day", "each day", "24 hours"],
+            
+            # Performance metrics
+            "performance": ["results", "outcome", "achievement", "success", "metrics", "kpi"],
+            "growth": ["increase", "expansion", "development", "progress", "improvement", "rise"],
+            "efficiency": ["productivity", "optimization", "effectiveness", "streamlining"],
+            "quality": ["standard", "excellence", "reliability", "consistency", "grade"],
+            
+            # Common abbreviations
+            "roi": ["return on investment", "return", "profitability", "investment return"],
+            "kpi": ["key performance indicator", "metric", "measure", "indicator"],
+            "ceo": ["chief executive officer", "president", "leader", "head"],
+            "cfo": ["chief financial officer", "finance head", "financial officer"],
+            "hr": ["human resources", "personnel", "people operations", "staff management"]
+        }
+    
+    def get_query_hash(self, query: str) -> str:
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+    
+    def expand_with_synonyms(self, query: str) -> List[str]:
+        """Expand using synonym database"""
+        expanded_terms = [query]
+        query_lower = query.lower()
+        query_words = query_lower.split()
+        
+        # Direct synonym matching
+        for word in query_words:
+            if word in self.synonyms:
+                expanded_terms.extend(self.synonyms[word])
+        
+        # Pattern-based expansion
+        for pattern_type, terms in self.expansion_patterns.items():
+            for term in terms:
+                if term in query_lower:
+                    expanded_terms.extend([t for t in terms if t != term])
+                    break
+        
+        # Remove duplicates
+        return list(dict.fromkeys(expanded_terms))
+    
+    def expand_with_similarity(self, query: str) -> List[str]:
+        """Use sentence similarity for expansion"""
         try:
-            # Load PDF
-            loader = PyPDFLoader(pdf_path)
-            documents = loader.load()
+            # Get all synonym values for similarity matching
+            all_terms = []
+            for synonyms in self.synonyms.values():
+                all_terms.extend(synonyms)
             
-            # Split documents
-            splits = self.text_splitter.split_documents(documents)
+            # Add query to compare
+            all_terms.append(query)
             
-            # Set up vector store
-            self._setup_vector_store()
+            # Get embeddings
+            embeddings = self.sentence_model.encode(all_terms)
+            query_embedding = embeddings[-1].reshape(1, -1)
+            term_embeddings = embeddings[:-1]
             
-            # Add documents to vector store
-            self.vector_store.add_documents(splits)
+            # Calculate similarities
+            similarities = cosine_similarity(query_embedding, term_embeddings)[0]
             
-            return f"Successfully processed and uploaded {len(splits)} chunks from the PDF!"
+            # Get top similar terms (threshold 0.5)
+            similar_terms = [all_terms[i] for i, sim in enumerate(similarities) if sim > 0.5]
             
-        except Exception as e:
-            return f"Error processing PDF: {str(e)}"
-    
-    def upload_pdf_from_bytes(self, pdf_bytes: bytes, filename: str = "uploaded.pdf") -> str:
-        """
-        Upload and process a PDF from bytes
-        
-        Args:
-            pdf_bytes: PDF file as bytes
-            filename: Name for the temporary file
-            
-        Returns:
-            Success message
-        """
-        try:
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(pdf_bytes)
-                tmp_path = tmp_file.name
-            
-            # Process the PDF
-            result = self.upload_pdf(tmp_path)
-            
-            # Clean up
-            os.unlink(tmp_path)
-            
-            return result
-            
-        except Exception as e:
-            return f"Error processing PDF bytes: {str(e)}"
-    
-    def _retrieve_context(self, query: str, k: int = 4) -> str:
-        """Retrieve relevant context from the vector store"""
-        if not self.vector_store:
-            return "No PDF has been uploaded yet. Please upload a PDF first."
-        
-        try:
-            # Retrieve relevant documents
-            retriever = self.vector_store.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": k}
-            )
-            
-            docs = retriever.invoke(query)
-            
-            # Format context
-            context = "\n\n".join([doc.page_content for doc in docs])
-            return context
-            
-        except Exception as e:
-            return f"Error retrieving context: {str(e)}"
-    
-    def _chat_node(self, state: PDFChatbotState) -> Dict[str, Any]:
-        """Main chat node that handles the conversation"""
-        # Get the last user message
-        last_message = state["messages"][-1]
-        
-        if isinstance(last_message, HumanMessage):
-            query = last_message.content
-            
-            # Retrieve context from PDF
-            context = self._retrieve_context(query)
-            
-            # Trim messages to fit context window
-            trimmed_messages = self.trimmer.invoke(state["messages"])
-            
-            # Create prompt with context
-            prompt = self.prompt_template.invoke({
-                "context": context,
-                "messages": trimmed_messages
-            })
-            
-            # Generate response
-            response = self.llm.invoke(prompt)
-            
-            return {"messages": [AIMessage(content=response)]}
-        
-        return {"messages": []}
-    
-    def chat(self, message: str, thread_id: str = "default") -> str:
-        """
-        Chat with the PDF
-        
-        Args:
-            message: User message
-            thread_id: Thread ID for conversation history
-            
-        Returns:
-            Bot response
-        """
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        input_messages = [HumanMessage(content=message)]
-        
-        try:
-            output = self.app.invoke({
-                "messages": input_messages,
-                "pdf_processed": self.vector_store is not None,
-                "collection_name": self.collection_name
-            }, config)
-            
-            return output["messages"][-1].content
+            # Combine with original query
+            expanded_terms = [query] + similar_terms
+            return list(dict.fromkeys(expanded_terms))
             
         except Exception as e:
-            return f"Error: {str(e)}"
+            print(f"Similarity expansion failed: {e}")
+            return [query]
     
-    def stream_chat(self, message: str, thread_id: str = "default"):
-        """
-        Stream chat response
+    def get_cached_expansion(self, query: str) -> Optional[List[str]]:
+        """Get cached expansion"""
+        query_hash = self.get_query_hash(query)
         
-        Args:
-            message: User message
-            thread_id: Thread ID for conversation history
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT expanded_terms, created_at FROM query_expansions 
+                WHERE query_hash = ?
+            ''', (query_hash,))
             
-        Yields:
-            Response chunks
-        """
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        input_messages = [HumanMessage(content=message)]
-        
-        try:
-            for chunk, metadata in self.app.stream({
-                "messages": input_messages,
-                "pdf_processed": self.vector_store is not None,
-                "collection_name": self.collection_name
-            }, config, stream_mode="messages"):
+            result = cursor.fetchone()
+            if result:
+                expanded_terms, created_at = result
+                created_date = datetime.fromisoformat(created_at)
                 
-                if isinstance(chunk, AIMessage):
-                    yield chunk.content
-                    
-        except Exception as e:
-            yield f"Error: {str(e)}"
+                # Check if cache is valid (30 days)
+                if datetime.now() - created_date < timedelta(days=30):
+                    cursor.execute('''
+                        UPDATE query_expansions 
+                        SET access_count = access_count + 1 
+                        WHERE query_hash = ?
+                    ''', (query_hash,))
+                    conn.commit()
+                    return json.loads(expanded_terms)
+        
+        return None
     
-    def clear_collection(self):
-        """Clear the vector store collection"""
+    def cache_expansion(self, query: str, expanded_terms: List[str]):
+        """Cache expansion results"""
+        query_hash = self.get_query_hash(query)
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO query_expansions 
+                (query_hash, original_query, expanded_terms, created_at, access_count)
+                VALUES (?, ?, ?, ?, 1)
+            ''', (query_hash, query, json.dumps(expanded_terms), datetime.now().isoformat()))
+            conn.commit()
+
+class FreePDFChatbot:
+    """Free PDF chatbot using Hugging Face models"""
+    
+    def __init__(self):
+        print("Initializing free PDF chatbot...")
+        
+        # Load free models
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Initialize QA pipeline with a free model
+        print("Loading QA model...")
+        self.qa_pipeline = pipeline(
+            "question-answering",
+            model="distilbert-base-cased-distilled-squad",
+            tokenizer="distilbert-base-cased-distilled-squad"
+        )
+        
+        self.documents = []
+        self.document_embeddings = None
+        self.vectorstore = None
+        self.query_cache = FreeQueryExpansionCache()
+        self.expansion_stats = {"synonym_hits": 0, "similarity_hits": 0, "cache_hits": 0}
+    
+    def load_pdf(self, pdf_path: str) -> bool:
+        """Load PDF using PyPDF2 (free)"""
         try:
-            self.qdrant_client.delete_collection(self.collection_name)
-            self.vector_store = None
-            return "Collection cleared successfully!"
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Extract text from all pages
+                text = ""
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+                
+                # Split into chunks
+                chunks = self.split_text(text)
+                self.documents = chunks
+                
+                # Create embeddings
+                print("Creating embeddings...")
+                self.document_embeddings = self.sentence_model.encode(chunks)
+                
+                # Create FAISS index
+                dimension = self.document_embeddings.shape[1]
+                self.vectorstore = faiss.IndexFlatL2(dimension)
+                self.vectorstore.add(self.document_embeddings.astype('float32'))
+                
+                print(f"Loaded PDF with {len(chunks)} chunks")
+                return True
+                
         except Exception as e:
-            return f"Error clearing collection: {str(e)}"
-
-# Example usage
-def main():
-    """Example usage of the PDF chatbot"""
+            print(f"Error loading PDF: {e}")
+            return False
     
-    # Initialize the chatbot
-    chatbot = PDFChatbot(
-        collection_name="my_pdf_docs"
-    )
+    def split_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Simple text splitting"""
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            
+            # Try to end at a sentence boundary
+            if end < len(text):
+                last_period = chunk.rfind('.')
+                if last_period > chunk_size // 2:
+                    end = start + last_period + 1
+                    chunk = text[start:end]
+            
+            chunks.append(chunk.strip())
+            start = end - overlap
+            
+        return [chunk for chunk in chunks if chunk]
     
-    # Example 1: Upload a PDF file
-    # pdf_path = "your_document.pdf"
-    # result = chatbot.upload_pdf(pdf_path)
-    # print(result)
+    def expand_query_hybrid(self, query: str) -> List[str]:
+        """Free hybrid expansion"""
+        # Try cache first
+        cached = self.query_cache.get_cached_expansion(query)
+        if cached:
+            self.expansion_stats["cache_hits"] += 1
+            return cached
+        
+        # Try synonyms
+        synonym_expansion = self.query_cache.expand_with_synonyms(query)
+        if len(synonym_expansion) > 1:
+            self.expansion_stats["synonym_hits"] += 1
+            self.query_cache.cache_expansion(query, synonym_expansion)
+            return synonym_expansion
+        
+        # Try similarity-based expansion
+        similarity_expansion = self.query_cache.expand_with_similarity(query)
+        if len(similarity_expansion) > 1:
+            self.expansion_stats["similarity_hits"] += 1
+            self.query_cache.cache_expansion(query, similarity_expansion)
+            return similarity_expansion
+        
+        return [query]
     
-    # Example 2: Chat with the PDF
-    # response = chatbot.chat("What is the main topic of this document?")
-    # print(response)
+    def retrieve_relevant_docs(self, query: str, k: int = 3) -> List[str]:
+        """Retrieve relevant documents"""
+        if not self.vectorstore:
+            return []
+        
+        # Expand query
+        expanded_terms = self.expand_query_hybrid(query)
+        expanded_query = " ".join(expanded_terms)
+        
+        # Get query embedding
+        query_embedding = self.sentence_model.encode([expanded_query])
+        
+        # Search
+        distances, indices = self.vectorstore.search(query_embedding.astype('float32'), k)
+        
+        # Return relevant documents
+        relevant_docs = [self.documents[i] for i in indices[0] if i < len(self.documents)]
+        return relevant_docs
     
-    # Example 3: Stream response
-    # for chunk in chatbot.stream_chat("Summarize the key points"):
-    #     print(chunk, end="", flush=True)
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """Answer question using free models"""
+        if not self.documents:
+            return {
+                "answer": "No PDF loaded. Please upload a PDF first.",
+                "expanded_terms": [],
+                "expansion_method": "none"
+            }
+        
+        try:
+            # Track expansion method
+            original_stats = self.expansion_stats.copy()
+            
+            # Get relevant documents
+            relevant_docs = self.retrieve_relevant_docs(question)
+            
+            if not relevant_docs:
+                return {
+                    "answer": "No relevant information found in the document.",
+                    "expanded_terms": [],
+                    "expansion_method": "none"
+                }
+            
+            # Combine documents for context
+            context = " ".join(relevant_docs)
+            
+            # Truncate context if too long (model limitation)
+            if len(context) > 4000:
+                context = context[:4000]
+            
+            # Get answer using QA pipeline
+            result = self.qa_pipeline(question=question, context=context)
+            
+            # Determine expansion method
+            expansion_method = "none"
+            if self.expansion_stats["cache_hits"] > original_stats["cache_hits"]:
+                expansion_method = "cache"
+            elif self.expansion_stats["synonym_hits"] > original_stats["synonym_hits"]:
+                expansion_method = "synonym_database"
+            elif self.expansion_stats["similarity_hits"] > original_stats["similarity_hits"]:
+                expansion_method = "similarity"
+            
+            # Get expanded terms
+            expanded_terms = self.expand_query_hybrid(question)
+            
+            return {
+                "answer": result['answer'],
+                "confidence": result['score'],
+                "expanded_terms": expanded_terms,
+                "expansion_method": expansion_method,
+                "stats": self.expansion_stats.copy()
+            }
+            
+        except Exception as e:
+            return {
+                "answer": f"Error processing question: {str(e)}",
+                "expanded_terms": [],
+                "expansion_method": "error"
+            }
     
-    print("PDF Chatbot initialized successfully!")
-    print("To use:")
-    print("1. Upload a PDF: chatbot.upload_pdf('path/to/your/file.pdf')")
-    print("2. Chat: chatbot.chat('Your question here')")
-    print("3. Stream: for chunk in chatbot.stream_chat('Your question'): print(chunk, end='')")
-    
-    return chatbot
-
-if __name__ == "__main__":
-    # You'll need to install the required packages:
-    """
-    pip install langchain-core langgraph langchain-google-genai langchain-qdrant
-    pip install pypdf qdrant-client langchain-community
-    """
-    
-    chatbot = main()
+    def get_expansion_stats(self) -> Dict[str, Any]:
+        """Get statistics"""
+        total_queries = sum(self.expansion_stats.values())
+        
+        return {
+            "session_stats": self.expansion_stats,
+            "cost_savings": {
+                "synonym_db_usage": f"{(self.expansion_stats['synonym_hits'] / max(total_queries, 1)) * 100:.1f}%",
+                "similarity_usage": f"{(self.expansion_stats['similarity_hits'] / max(total_queries, 1)) * 100:.1f}%",
+                "cache_usage": f"{(self.expansion_stats['cache_hits'] / max(total_queries, 1)) * 100:.1f}%"
+            },
+            "total_queries": total_queries
+        }

@@ -1,264 +1,220 @@
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 import os
-import json
-from pdf_chatbot import PDFChatbot  # Import our chatbot class
+import tempfile
+import time
+from pdf_chatbot import FreePDFChatbot
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# Initialize chatbot
-chatbot = PDFChatbot(collection_name="web_pdf_docs")
+# Initialize free chatbot (no API key needed!)
+chatbot = FreePDFChatbot()
 
-# HTML template
-HTML_TEMPLATE = """
+# Minimal HTML template with installation instructions
+HTML_TEMPLATE = '''
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF Chatbot</title>
+    <title>Free PDF RAG Chatbot</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .upload-section {
-            margin-bottom: 30px;
-            padding: 20px;
-            background-color: #f8f9fa;
-            border-radius: 5px;
-            border: 2px dashed #dee2e6;
-        }
-        .chat-section {
-            margin-top: 30px;
-        }
-        .message {
-            margin: 10px 0;
-            padding: 10px 15px;
-            border-radius: 10px;
-            max-width: 70%;
-        }
-        .user-message {
-            background-color: #007bff;
-            color: white;
-            margin-left: auto;
-        }
-        .bot-message {
-            background-color: #e9ecef;
-            color: #333;
-        }
-        .chat-container {
-            height: 400px;
-            overflow-y: auto;
-            border: 1px solid #dee2e6;
-            padding: 15px;
-            margin-bottom: 15px;
-            border-radius: 5px;
-            background-color: #fafafa;
-        }
-        .input-group {
-            display: flex;
-            gap: 10px;
-        }
-        input[type="text"] {
-            flex: 1;
-            padding: 10px;
-            border: 1px solid #dee2e6;
-            border-radius: 5px;
-            font-size: 16px;
-        }
-        button {
-            padding: 10px 20px;
-            background-color: #007bff;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        button:hover {
-            background-color: #0056b3;
-        }
-        button:disabled {
-            background-color: #6c757d;
-            cursor: not-allowed;
-        }
-        .file-input {
-            padding: 10px;
-            border: 1px solid #dee2e6;
-            border-radius: 5px;
-            background-color: white;
-            margin-right: 10px;
-        }
-        .status {
-            padding: 10px;
-            margin: 10px 0;
-            border-radius: 5px;
-        }
-        .status.success {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .status.error {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        .loading {
-            display: none;
-            color: #6c757d;
-            font-style: italic;
-        }
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .section { margin: 20px 0; padding: 20px; border: 1px solid #ddd; }
+        .messages { height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin: 10px 0; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user { background-color: #e3f2fd; }
+        .bot { background-color: #f3e5f5; }
+        .expansion-info { font-size: 0.9em; color: #666; margin-top: 5px; }
+        input[type="text"] { width: 70%; padding: 10px; }
+        button { padding: 10px 20px; margin: 5px; }
+        .stats { font-size: 0.9em; color: #666; }
+        .install-info { background-color: #fff3cd; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .success { color: green; }
+        .error { color: red; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 PDF Chatbot</h1>
+        <h1>Free PDF RAG Chatbot</h1>
+        <p><strong>✅ No API Keys Required!</strong> Uses free Hugging Face models.</p>
         
-        <div class="upload-section">
-            <h3>Upload PDF Document</h3>
-            <div style="display: flex; align-items: center; gap: 10px;">
-                <input type="file" id="pdfFile" accept=".pdf" class="file-input">
-                <button onclick="uploadPDF()">Upload PDF</button>
-            </div>
-            <div id="uploadStatus"></div>
+        <div class="install-info">
+            <h3>Required Dependencies:</h3>
+            <code>pip install flask sentence-transformers transformers torch faiss-cpu PyPDF2 scikit-learn</code>
+            <br><br>
+            <strong>Note:</strong> First run will download ~500MB of AI models. This is normal and only happens once.
         </div>
         
-        <div class="chat-section">
-            <h3>Chat with your PDF</h3>
-            <div id="chatContainer" class="chat-container"></div>
-            <div class="loading" id="loadingIndicator">Bot is typing...</div>
-            <div class="input-group">
-                <input type="text" id="messageInput" placeholder="Ask a question about your PDF..." onkeypress="handleKeyPress(event)">
-                <button onclick="sendMessage()" id="sendButton">Send</button>
+        <div class="section">
+            <h3>Upload PDF</h3>
+            <form id="upload-form" enctype="multipart/form-data">
+                <input type="file" name="pdf" accept=".pdf" required>
+                <button type="submit">Upload PDF</button>
+            </form>
+            <div id="upload-status"></div>
+        </div>
+        
+        <div class="section">
+            <h3>Chat</h3>
+            <div id="messages" class="messages">
+                <div class="message bot">
+                    <strong>Bot:</strong> Upload a PDF to start chatting! I'll use smart query expansion to find better answers.
+                </div>
             </div>
+            <div>
+                <input type="text" id="question" placeholder="Ask a question about your PDF...">
+                <button onclick="sendQuestion()">Send</button>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h3>Cost Optimization Stats</h3>
+            <button onclick="loadStats()">Refresh Stats</button>
+            <div id="stats-display"></div>
         </div>
     </div>
 
     <script>
-        let threadId = 'web_' + Math.random().toString(36).substr(2, 9);
-        
-        function uploadPDF() {
-            const fileInput = document.getElementById('pdfFile');
-            const file = fileInput.files[0];
-            const statusDiv = document.getElementById('uploadStatus');
+        // Upload PDF
+        document.getElementById('upload-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const status = document.getElementById('upload-status');
             
-            if (!file) {
-                showStatus('Please select a PDF file', 'error');
-                return;
-            }
+            status.innerHTML = '⏳ Uploading and processing PDF... This may take a moment.';
             
-            if (file.type !== 'application/pdf') {
-                showStatus('Please select a valid PDF file', 'error');
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append('pdf', file);
-            
-            showStatus('Uploading and processing PDF...', 'info');
-            
-            fetch('/upload', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    showStatus(data.message, 'success');
-                    fileInput.value = '';
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    status.innerHTML = `✅ ${result.message}`;
+                    status.className = 'success';
                 } else {
-                    showStatus(data.message, 'error');
+                    status.innerHTML = `❌ ${result.message}`;
+                    status.className = 'error';
                 }
-            })
-            .catch(error => {
-                showStatus('Error uploading file: ' + error, 'error');
-            });
-        }
+            } catch (error) {
+                status.innerHTML = '❌ Upload failed: ' + error.message;
+                status.className = 'error';
+            }
+        });
         
-        function sendMessage() {
-            const messageInput = document.getElementById('messageInput');
-            const message = messageInput.value.trim();
+        // Send question
+        async function sendQuestion() {
+            const question = document.getElementById('question').value;
+            if (!question.trim()) return;
             
-            if (!message) return;
+            const messagesDiv = document.getElementById('messages');
             
-            addMessage(message, 'user');
-            messageInput.value = '';
+            // Add user message
+            messagesDiv.innerHTML += `
+                <div class="message user">
+                    <strong>You:</strong> ${question}
+                </div>
+            `;
             
-            const sendButton = document.getElementById('sendButton');
-            const loadingIndicator = document.getElementById('loadingIndicator');
+            // Clear input
+            document.getElementById('question').value = '';
             
-            sendButton.disabled = true;
-            loadingIndicator.style.display = 'block';
+            // Add loading message
+            messagesDiv.innerHTML += `
+                <div class="message bot" id="loading">
+                    <strong>Bot:</strong> <em>🤔 Thinking and expanding your query...</em>
+                </div>
+            `;
             
-            fetch('/chat', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    message: message,
-                    thread_id: threadId
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                addMessage(data.response, 'bot');
-                sendButton.disabled = false;
-                loadingIndicator.style.display = 'none';
-            })
-            .catch(error => {
-                addMessage('Error: ' + error, 'bot');
-                sendButton.disabled = false;
-                loadingIndicator.style.display = 'none';
-            });
-        }
-        
-        function addMessage(text, sender) {
-            const chatContainer = document.getElementById('chatContainer');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${sender}-message`;
-            messageDiv.textContent = text;
-            chatContainer.appendChild(messageDiv);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-        }
-        
-        function showStatus(message, type) {
-            const statusDiv = document.getElementById('uploadStatus');
-            statusDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
-            setTimeout(() => {
-                statusDiv.innerHTML = '';
-            }, 5000);
-        }
-        
-        function handleKeyPress(event) {
-            if (event.key === 'Enter') {
-                sendMessage();
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            
+            try {
+                const response = await fetch('/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({question: question})
+                });
+                
+                const result = await response.json();
+                
+                // Remove loading message
+                document.getElementById('loading').remove();
+                
+                // Add confidence indicator
+                const confidenceColor = result.confidence > 0.7 ? 'green' : result.confidence > 0.4 ? 'orange' : 'red';
+                const confidenceText = result.confidence ? `(Confidence: ${(result.confidence * 100).toFixed(1)}%)` : '';
+                
+                // Add expansion info
+                const expansionInfo = result.expanded_terms && result.expanded_terms.length > 1 ? 
+                    `<div class="expansion-info">
+                        <strong>🔍 Expansion Method:</strong> ${result.expansion_method}<br>
+                        <strong>📝 Search Terms:</strong> ${result.expanded_terms.join(', ')}
+                    </div>` : '';
+                
+                messagesDiv.innerHTML += `
+                    <div class="message bot">
+                        <strong>Bot:</strong> ${result.answer} 
+                        <span style="color: ${confidenceColor}; font-size: 0.8em;">${confidenceText}</span>
+                        ${expansionInfo}
+                    </div>
+                `;
+                
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                
+            } catch (error) {
+                document.getElementById('loading').remove();
+                messagesDiv.innerHTML += `
+                    <div class="message bot">
+                        <strong>Bot:</strong> ❌ Error: ${error.message}
+                    </div>
+                `;
             }
         }
         
-        // Initialize
-        addMessage('Hello! Upload a PDF document and start asking questions about it.', 'bot');
+        // Load stats
+        async function loadStats() {
+            try {
+                const response = await fetch('/stats');
+                const stats = await response.json();
+                
+                document.getElementById('stats-display').innerHTML = `
+                    <div class="stats">
+                        <h4>💰 Cost Optimization (Free Model):</h4>
+                        <p>✅ Synonym DB usage: ${stats.cost_savings.synonym_db_usage} (Free)</p>
+                        <p>🔄 Similarity usage: ${stats.cost_savings.similarity_usage} (Free)</p>
+                        <p>💾 Cache usage: ${stats.cost_savings.cache_usage} (Free)</p>
+                        <p><strong>Total queries processed: ${stats.total_queries}</strong></p>
+                        
+                        <h4>📊 Session Stats:</h4>
+                        <p>Synonym hits: ${stats.session_stats.synonym_hits}</p>
+                        <p>Similarity hits: ${stats.session_stats.similarity_hits}</p>
+                        <p>Cache hits: ${stats.session_stats.cache_hits}</p>
+                        
+                        <p><strong>💡 All processing is FREE - no API costs!</strong></p>
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('stats-display').innerHTML = '❌ Error loading stats: ' + error.message;
+            }
+        }
+        
+        // Enter key support
+        document.getElementById('question').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendQuestion();
+            }
+        });
+        
+        // Load initial stats
+        loadStats();
     </script>
 </body>
 </html>
-"""
+'''
 
 @app.route('/')
 def index():
@@ -268,85 +224,89 @@ def index():
 def upload_pdf():
     try:
         if 'pdf' not in request.files:
-            return jsonify({'success': False, 'message': 'No file uploaded'})
+            return jsonify({'success': False, 'message': 'No PDF file provided'})
         
         file = request.files['pdf']
-        
         if file.filename == '':
             return jsonify({'success': False, 'message': 'No file selected'})
         
-        if file and file.filename.lower().endswith('.pdf'):
-            # Read file as bytes
-            pdf_bytes = file.read()
+        if not file.filename.lower().endswith('.pdf'):
+            return jsonify({'success': False, 'message': 'Please upload a PDF file'})
+        
+        # Save file temporarily - Windows-safe approach
+        filename = secure_filename(file.filename)
+        tmp_path = os.path.join(tempfile.gettempdir(), f"temp_pdf_{os.getpid()}_{filename}")
+        
+        try:
+            file.save(tmp_path)
             
-            # Process PDF
-            result = chatbot.upload_pdf_from_bytes(pdf_bytes, file.filename)
+            # Load PDF into chatbot
+            success = chatbot.load_pdf(tmp_path)
             
-            if result.startswith('Successfully'):
-                return jsonify({'success': True, 'message': result})
+            if success:
+                return jsonify({
+                    'success': True, 
+                    'message': f'PDF "{filename}" uploaded and processed successfully! Ready for questions.'
+                })
             else:
-                return jsonify({'success': False, 'message': result})
-        else:
-            return jsonify({'success': False, 'message': 'Invalid file type. Please upload a PDF.'})
+                return jsonify({
+                    'success': False, 
+                    'message': 'Failed to process PDF. Please check the file format.'
+                })
+                
+        finally:
+            # Clean up temp file (Windows-safe)
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except PermissionError:
+                # File still in use, try again after delay
+                time.sleep(0.5)
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass  # Let OS handle cleanup
     
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
-@app.route('/chat', methods=['POST'])
-def chat():
+@app.route('/query', methods=['POST'])
+def query_pdf():
     try:
         data = request.get_json()
-        message = data.get('message')
-        thread_id = data.get('thread_id', 'default')
+        question = data.get('question', '')
         
-        if not message:
-            return jsonify({'response': 'Please provide a message'})
+        if not question.strip():
+            return jsonify({'answer': 'Please provide a question'})
         
-        # Get response from chatbot
-        response = chatbot.chat(message, thread_id)
+        # Get response with expansion info
+        result = chatbot.answer_question(question)
         
-        return jsonify({'response': response})
+        return jsonify(result)
     
     except Exception as e:
-        return jsonify({'response': f'Error: {str(e)}'})
+        return jsonify({
+            'answer': f'Error: {str(e)}',
+            'expanded_terms': [],
+            'expansion_method': 'error'
+        })
 
-@app.route('/stream_chat', methods=['POST'])
-def stream_chat():
+@app.route('/stats')
+def get_stats():
     try:
-        data = request.get_json()
-        message = data.get('message')
-        thread_id = data.get('thread_id', 'default')
-        
-        if not message:
-            return jsonify({'response': 'Please provide a message'})
-        
-        def generate():
-            for chunk in chatbot.stream_chat(message, thread_id):
-                yield f"data: {json.dumps({'chunk': chunk})}\n\n"
-        
-        return generate(), {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-        }
-    
+        stats = chatbot.get_expansion_stats()
+        return jsonify(stats)
     except Exception as e:
-        return jsonify({'response': f'Error: {str(e)}'})
+        return jsonify({'error': str(e)})
 
-@app.route('/clear', methods=['POST'])
-def clear_collection():
-    try:
-        result = chatbot.clear_collection()
-        return jsonify({'success': True, 'message': result})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+@app.route('/health')
+def health_check():
+    return jsonify({'status': 'healthy', 'message': 'Free PDF RAG Chatbot is running'})
 
 if __name__ == '__main__':
-    print("Starting PDF Chatbot Server...")
-    print("Make sure you have:")
-    print("1. Qdrant server running (docker run -p 6333:6333 qdrant/qdrant)")
-    print("2. Your Google API key set as environment variable")
-    print("3. All required packages installed")
-    print("\nAccess the app at: http://localhost:5000")
+    print("🚀 Starting Free PDF RAG Chatbot...")
+    print("📋 Required packages: flask sentence-transformers transformers torch faiss-cpu PyPDF2 scikit-learn")
+    print("⚠️  First run will download AI models (~500MB). This is normal!")
+    print("💰 No API keys required - everything runs locally!")
     
     app.run(debug=True, host='0.0.0.0', port=5000)
